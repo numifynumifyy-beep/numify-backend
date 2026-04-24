@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-playwright==1.40.0
+playwright
 phonenumbers
 firebase-admin
 python-dotenv
