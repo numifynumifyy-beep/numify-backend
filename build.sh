@@ -1,3 +1,2 @@
 pip install -r requirements.txt
-playwright install chromium
-playwright install-deps chromium
+playwright install chromium --with-deps
