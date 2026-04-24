@@ -1,3 +1,5 @@
+import os
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
 import asyncio, re, time
 import phonenumbers
 import firebase_admin
