@@ -1,12 +1,12 @@
 import asyncio
 import re
 import time
+import httpx
 import phonenumbers
 import firebase_admin
 from firebase_admin import credentials, firestore, auth
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from playwright.async_api import async_playwright
 from datetime import datetime, timezone
 
 cred = credentials.Certificate("serviceAccountKey.json")
@@ -55,6 +55,46 @@ def check_subscription(uid: str):
         return False
     return True
 
+def extract_username(url: str) -> str:
+    match = re.search(r'tiktok\.com/@([^/]+)', url)
+    if match:
+        return match.group(1)
+    return ""
+
+async def get_room_id(username: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://www.tiktok.com/"
+    }
+    url = f"https://www.tiktok.com/@{username}/live"
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        resp = await client.get(url, headers=headers)
+        text = resp.text
+        match = re.search(r'"roomId"\s*:\s*"(\d+)"', text)
+        if match:
+            return match.group(1)
+        match = re.search(r'room_id=(\d+)', text)
+        if match:
+            return match.group(1)
+    return ""
+
+async def fetch_chat(room_id: str, cursor: str = "0"):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Referer": f"https://www.tiktok.com/",
+    }
+    params = {
+        "room_id": room_id,
+        "cursor": cursor,
+        "count": "20"
+    }
+    url = "https://www.tiktok.com/api/live/get_chat/"
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url, headers=headers, params=params)
+        if resp.status_code == 200:
+            return resp.json()
+    return {}
+
 @app.get("/")
 def root():
     return {"status": "Numify backend is running"}
@@ -93,113 +133,67 @@ async def scrape_ws(websocket: WebSocket):
             await websocket.send_json({"type": "error", "message": "No active subscription"})
             return
 
-        await websocket.send_json({"type": "status", "message": "Launching browser..."})
+        username = extract_username(live_url)
+        if not username:
+            await websocket.send_json({"type": "error", "message": "Invalid TikTok URL"})
+            return
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-software-rasterizer",
-                    "--disable-extensions",
-                    "--disable-background-networking",
-                    "--disable-default-apps",
-                    "--disable-sync",
-                    "--disable-translate",
-                    "--hide-scrollbars",
-                    "--metrics-recording-only",
-                    "--mute-audio",
-                    "--no-first-run",
-                    "--safebrowsing-disable-auto-update",
-                    "--disable-features=TranslateUI",
-                    "--disable-ipc-flooding-protection",
-                    "--window-size=1280,720"
-                ]
-            )
+        await websocket.send_json({"type": "status", "message": f"Finding live stream for @{username}..."})
 
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 720},
-                java_script_enabled=True
-            )
+        room_id = await get_room_id(username)
+        if not room_id:
+            await websocket.send_json({"type": "error", "message": f"Could not find live stream for @{username}. Make sure they are live right now."})
+            return
 
-            page = await context.new_page()
+        await websocket.send_json({"type": "status", "message": f"Connected! Room ID: {room_id}. Monitoring chat..."})
 
-            await websocket.send_json({"type": "status", "message": "Opening TikTok Live..."})
+        seen_comments = set()
+        seen_numbers = set()
+        cursor = "0"
 
+        while True:
             try:
-                await page.goto(live_url, timeout=60000, wait_until="domcontentloaded")
-                await websocket.send_json({"type": "status", "message": "Page opened successfully..."})
-            except Exception as e:
-                await websocket.send_json({"type": "status", "message": "Page loaded with warnings, continuing..."})
+                data = await fetch_chat(room_id, cursor)
 
-            await asyncio.sleep(10)
-            await websocket.send_json({"type": "status", "message": "Scanning chat for numbers..."})
+                if not data:
+                    await websocket.send_json({"type": "status", "message": "Waiting for messages..."})
+                    await asyncio.sleep(3)
+                    continue
 
-            seen_comments = set()
-            seen_numbers = set()
-            empty_cycles = 0
+                messages = data.get("data", {}).get("messages", [])
+                if not messages:
+                    messages = data.get("messages", [])
 
-            while True:
-                try:
-                    elements = await page.query_selector_all("div[data-e2e='chat-message']")
-
-                    if not elements:
-                        elements = await page.query_selector_all("[class*='ChatMessage']")
-
-                    if not elements:
-                        elements = await page.query_selector_all("[class*='chat-message']")
-
-                    if not elements:
-                        elements = await page.query_selector_all("[class*='chatMessage']")
-
-                    if not elements:
-                        elements = await page.query_selector_all("[class*='LiveComment']")
-
-                    if not elements:
-                        elements = await page.query_selector_all("[class*='comment']")
-
-                    if not elements:
-                        empty_cycles += 1
-                        await websocket.send_json({
-                            "type": "status",
-                            "message": f"Waiting for chat messages... ({empty_cycles * 2}s elapsed)"
-                        })
-                        await asyncio.sleep(2)
-                        continue
-
-                    empty_cycles = 0
-
-                    for el in elements:
-                        try:
-                            text = (await el.inner_text()).strip()
-                        except Exception:
+                for msg in messages:
+                    try:
+                        content = ""
+                        if isinstance(msg, dict):
+                            content = msg.get("content", "") or msg.get("comment", "") or msg.get("text", "") or str(msg)
+                        if not content or content in seen_comments:
                             continue
+                        seen_comments.add(content)
 
-                        if not text or text in seen_comments:
-                            continue
-                        seen_comments.add(text)
-
-                        for num in extract_numbers(text):
+                        numbers = extract_numbers(content)
+                        for num in numbers:
                             if num not in seen_numbers:
                                 seen_numbers.add(num)
                                 await websocket.send_json({
                                     "type": "number",
                                     "number": num,
-                                    "comment": text[:120],
+                                    "comment": content[:120],
                                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                                 })
+                    except Exception:
+                        continue
 
-                except Exception as e:
-                    await websocket.send_json({
-                        "type": "status",
-                        "message": f"Scan error: {str(e)[:50]}"
-                    })
+                new_cursor = data.get("data", {}).get("cursor", "")
+                if new_cursor:
+                    cursor = str(new_cursor)
 
-                await asyncio.sleep(2)
+            except Exception as e:
+                await websocket.send_json({"type": "status", "message": f"Retrying... {str(e)[:40]}"})
+
+            await asyncio.sleep(3)
 
     except WebSocketDisconnect:
         pass
