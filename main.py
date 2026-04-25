@@ -99,72 +99,105 @@ async def scrape_ws(websocket: WebSocket):
             browser = await p.chromium.launch(
                 headless=True,
                 args=[
-                    "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
+                    "--disable-software-rasterizer",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-default-apps",
+                    "--disable-sync",
+                    "--disable-translate",
+                    "--hide-scrollbars",
+                    "--metrics-recording-only",
+                    "--mute-audio",
                     "--no-first-run",
-                    "--no-zygote",
-                    "--single-process"
+                    "--safebrowsing-disable-auto-update",
+                    "--disable-features=TranslateUI",
+                    "--disable-ipc-flooding-protection",
+                    "--window-size=1280,720"
                 ]
             )
+
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 720}
+                viewport={"width": 1280, "height": 720},
+                java_script_enabled=True
             )
+
             page = await context.new_page()
 
             await websocket.send_json({"type": "status", "message": "Opening TikTok Live..."})
 
             try:
-                await page.goto(live_url, timeout=30000, wait_until="domcontentloaded")
-            except Exception:
-                await websocket.send_json({"type": "status", "message": "Page loaded, continuing..."})
+                await page.goto(live_url, timeout=60000, wait_until="domcontentloaded")
+                await websocket.send_json({"type": "status", "message": "Page opened successfully..."})
+            except Exception as e:
+                await websocket.send_json({"type": "status", "message": "Page loaded with warnings, continuing..."})
 
-            await asyncio.sleep(8)
-            await websocket.send_json({"type": "status", "message": "Scanning chat..."})
+            await asyncio.sleep(10)
+            await websocket.send_json({"type": "status", "message": "Scanning chat for numbers..."})
 
-            seen_comments, seen_numbers = set(), set()
+            seen_comments = set()
+            seen_numbers = set()
             empty_cycles = 0
 
             while True:
-                elements = await page.query_selector_all("div[data-e2e='chat-message']")
-                if not elements:
-                    elements = await page.query_selector_all("[class*='ChatMessage']")
-                if not elements:
-                    elements = await page.query_selector_all("[class*='chat-message']")
-                if not elements:
-                    elements = await page.query_selector_all("[class*='chatMessage']")
+                try:
+                    elements = await page.query_selector_all("div[data-e2e='chat-message']")
 
-                if not elements:
-                    empty_cycles += 1
+                    if not elements:
+                        elements = await page.query_selector_all("[class*='ChatMessage']")
+
+                    if not elements:
+                        elements = await page.query_selector_all("[class*='chat-message']")
+
+                    if not elements:
+                        elements = await page.query_selector_all("[class*='chatMessage']")
+
+                    if not elements:
+                        elements = await page.query_selector_all("[class*='LiveComment']")
+
+                    if not elements:
+                        elements = await page.query_selector_all("[class*='comment']")
+
+                    if not elements:
+                        empty_cycles += 1
+                        await websocket.send_json({
+                            "type": "status",
+                            "message": f"Waiting for chat messages... ({empty_cycles * 2}s elapsed)"
+                        })
+                        await asyncio.sleep(2)
+                        continue
+
+                    empty_cycles = 0
+
+                    for el in elements:
+                        try:
+                            text = (await el.inner_text()).strip()
+                        except Exception:
+                            continue
+
+                        if not text or text in seen_comments:
+                            continue
+                        seen_comments.add(text)
+
+                        for num in extract_numbers(text):
+                            if num not in seen_numbers:
+                                seen_numbers.add(num)
+                                await websocket.send_json({
+                                    "type": "number",
+                                    "number": num,
+                                    "comment": text[:120],
+                                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                                })
+
+                except Exception as e:
                     await websocket.send_json({
                         "type": "status",
-                        "message": f"Waiting for chat... ({empty_cycles * 2}s)"
+                        "message": f"Scan error: {str(e)[:50]}"
                     })
-                    await asyncio.sleep(2)
-                    continue
-
-                empty_cycles = 0
-
-                for el in elements:
-                    try:
-                        text = (await el.inner_text()).strip()
-                    except Exception:
-                        continue
-                    if not text or text in seen_comments:
-                        continue
-                    seen_comments.add(text)
-                    for num in extract_numbers(text):
-                        if num not in seen_numbers:
-                            seen_numbers.add(num)
-                            await websocket.send_json({
-                                "type": "number",
-                                "number": num,
-                                "comment": text[:120],
-                                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-                            })
 
                 await asyncio.sleep(2)
 
