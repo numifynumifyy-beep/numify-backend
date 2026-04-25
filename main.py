@@ -63,11 +63,13 @@ def extract_username(url: str) -> str:
 
 async def get_room_id(username: str) -> str:
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
         "Referer": "https://www.tiktok.com/"
     }
     url = f"https://www.tiktok.com/@{username}/live"
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
         resp = await client.get(url, headers=headers)
         text = resp.text
         match = re.search(r'"roomId"\s*:\s*"(\d+)"', text)
@@ -76,24 +78,64 @@ async def get_room_id(username: str) -> str:
         match = re.search(r'room_id=(\d+)', text)
         if match:
             return match.group(1)
+        match = re.search(r'"liveRoomId"\s*:\s*"(\d+)"', text)
+        if match:
+            return match.group(1)
     return ""
 
-async def fetch_chat(room_id: str, cursor: str = "0"):
+async def fetch_chat_messages(room_id: str):
+    all_messages = []
+
+    urls_to_try = [
+        f"https://webcast.tiktok.com/webcast/im/fetch/?room_id={room_id}&cursor=0&internal_ext=&fetch_rule=1&version_code=180800",
+        f"https://www.tiktok.com/api/live/get_chat/?room_id={room_id}&cursor=0&count=50",
+        f"https://webcast.us.tiktok.com/webcast/im/fetch/?room_id={room_id}&cursor=0&fetch_rule=1",
+    ]
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Referer": f"https://www.tiktok.com/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.tiktok.com/",
+        "Origin": "https://www.tiktok.com",
     }
-    params = {
-        "room_id": room_id,
-        "cursor": cursor,
-        "count": "20"
-    }
-    url = "https://www.tiktok.com/api/live/get_chat/"
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url, headers=headers, params=params)
-        if resp.status_code == 200:
-            return resp.json()
-    return {}
+
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        for url in urls_to_try:
+            try:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        msgs = (
+                            data.get("data", {}).get("messages", []) or
+                            data.get("messages", []) or
+                            data.get("data", []) or
+                            []
+                        )
+                        if msgs:
+                            for m in msgs:
+                                if isinstance(m, dict):
+                                    text = (
+                                        m.get("content") or
+                                        m.get("comment") or
+                                        m.get("text") or
+                                        m.get("message") or ""
+                                    )
+                                    if text:
+                                        all_messages.append(text)
+                            if all_messages:
+                                break
+                    except Exception:
+                        text_content = resp.text
+                        words = re.findall(r'"content"\s*:\s*"([^"]+)"', text_content)
+                        all_messages.extend(words)
+                        if all_messages:
+                            break
+            except Exception:
+                continue
+
+    return all_messages
 
 @app.get("/")
 def root():
@@ -142,56 +184,52 @@ async def scrape_ws(websocket: WebSocket):
 
         room_id = await get_room_id(username)
         if not room_id:
-            await websocket.send_json({"type": "error", "message": f"Could not find live stream for @{username}. Make sure they are live right now."})
+            await websocket.send_json({
+                "type": "error",
+                "message": f"Could not find live stream for @{username}. Make sure they are live right now."
+            })
             return
 
-        await websocket.send_json({"type": "status", "message": f"Connected! Room ID: {room_id}. Monitoring chat..."})
+        await websocket.send_json({
+            "type": "status",
+            "message": f"Connected! Monitoring chat for @{username}..."
+        })
 
         seen_comments = set()
         seen_numbers = set()
-        cursor = "0"
+        cycle = 0
 
         while True:
+            cycle += 1
             try:
-                data = await fetch_chat(room_id, cursor)
+                messages = await fetch_chat_messages(room_id)
 
-                if not data:
-                    await websocket.send_json({"type": "status", "message": "Waiting for messages..."})
-                    await asyncio.sleep(3)
-                    continue
+                await websocket.send_json({
+                    "type": "status",
+                    "message": f"Scanning... found {len(messages)} messages this cycle"
+                })
 
-                messages = data.get("data", {}).get("messages", [])
-                if not messages:
-                    messages = data.get("messages", [])
-
-                for msg in messages:
-                    try:
-                        content = ""
-                        if isinstance(msg, dict):
-                            content = msg.get("content", "") or msg.get("comment", "") or msg.get("text", "") or str(msg)
-                        if not content or content in seen_comments:
-                            continue
-                        seen_comments.add(content)
-
-                        numbers = extract_numbers(content)
-                        for num in numbers:
-                            if num not in seen_numbers:
-                                seen_numbers.add(num)
-                                await websocket.send_json({
-                                    "type": "number",
-                                    "number": num,
-                                    "comment": content[:120],
-                                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-                                })
-                    except Exception:
+                for content in messages:
+                    if not content or content in seen_comments:
                         continue
+                    seen_comments.add(content)
 
-                new_cursor = data.get("data", {}).get("cursor", "")
-                if new_cursor:
-                    cursor = str(new_cursor)
+                    numbers = extract_numbers(content)
+                    for num in numbers:
+                        if num not in seen_numbers:
+                            seen_numbers.add(num)
+                            await websocket.send_json({
+                                "type": "number",
+                                "number": num,
+                                "comment": content[:120],
+                                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                            })
 
             except Exception as e:
-                await websocket.send_json({"type": "status", "message": f"Retrying... {str(e)[:40]}"})
+                await websocket.send_json({
+                    "type": "status",
+                    "message": f"Cycle {cycle} error: {str(e)[:60]}"
+                })
 
             await asyncio.sleep(3)
 
