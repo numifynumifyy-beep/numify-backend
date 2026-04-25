@@ -9,12 +9,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright
 from datetime import datetime, timezone
 
-# Firebase init
 cred = credentials.Certificate("serviceAccountKey.json")
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# App init
 app = FastAPI()
 
 app.add_middleware(
@@ -145,11 +143,6 @@ async def scrape_ws(websocket: WebSocket):
                         "type": "status",
                         "message": f"Waiting for chat... ({empty_cycles * 2}s)"
                     })
-                    if empty_cycles > 30:
-                        await websocket.send_json({
-                            "type": "status",
-                            "message": "No chat found. Make sure the live is active."
-                        })
                     await asyncio.sleep(2)
                     continue
 
