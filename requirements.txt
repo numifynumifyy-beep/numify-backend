@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
+playwright
 phonenumbers
 firebase-admin
 python-dotenv
 websockets
-httpx
